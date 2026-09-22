@@ -5,8 +5,8 @@
 [![Downloads](https://img.shields.io/github/downloads/NightHawkHSI/TexForge/total?label=downloads&color=00e87a)](https://github.com/NightHawkHSI/TexForge/releases)
 ![Views](https://komarev.com/ghpvc/?username=NightHawkHSI&repo=TexForge&label=views&color=0096ff)
 
-![TexForge conversion preview](screenshots/conversion-preview.png)
 ![TexForge info window](screenshots/info-window.png)
+![TexForge conversion preview](screenshots/conversion-preview.png)
 
 TexForge is a desktop texture conversion tool built in Python/Tkinter, designed primarily for game modders and 3D artists. It provides a graphical pipeline for batch-converting image files (PNG, JPG, TGA, BMP) into various output formats — most notably DDS (DirectX Surface), the standard texture format used by game engines like GTA V, Skyrim, Unity, and Unreal Engine.
 
