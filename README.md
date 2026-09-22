@@ -2,8 +2,8 @@
 # TexForge — v8.0
 > by DiccChops
 
-[![Downloads](https://img.shields.io/github/downloads/DiccChops/TexForge/total?label=downloads&color=00e87a)](https://github.com/DiccChops/TexForge/releases)
-![Views](https://komarev.com/ghpvc/?username=DiccChops&repo=TexForge&label=views&color=0096ff)
+[![Downloads](https://img.shields.io/github/downloads/NightHawkHSI/TexForge/total?label=downloads&color=00e87a)](https://github.com/NightHawkHSI/TexForge/releases)
+![Views](https://komarev.com/ghpvc/?username=NightHawkHSI&repo=TexForge&label=views&color=0096ff)
 
 Multi-format texture pipeline manager for modders and technical artists. Handles DDS, PNG, JPG, TGA, BMP, WebP, and SVG output with per-file tinting, PBR naming rules, batch conversion, and CI-ready headless mode.
 
