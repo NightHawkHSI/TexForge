@@ -113,6 +113,7 @@ Click ⚙ in the title bar to open Settings.
 
    Drag title bar    Move the window.
    Double-click bar  Maximise / restore.
+   Drag edge/corner  Resize the window.
    ─                 Minimise to taskbar.
    □ / ❐             Maximise / restore.
    ✕                 Close the application.
@@ -120,6 +121,6 @@ Click ⚙ in the title bar to open Settings.
 
 
 ===================================================================
-~ TexForge v6.0  •  Built with Python + Pillow + texconv
+~ TexForge v8.0  •  Built with Python + Pillow + texconv
 ===================================================================
 

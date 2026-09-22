@@ -43,7 +43,7 @@ else:
 # CONFIG
 # =========================
 TEXCONV_PATH     = "texconv.exe"
-VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tga", ".bmp")
+VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".webp")
 
 COLORS = {
     "bg":       "#141414",
@@ -238,6 +238,77 @@ def save_as_svg(img: Image.Image, dst_path: str):
 
 
 # =========================
+# POWER-OF-TWO HELPERS
+# =========================
+def _is_pot(n: int) -> bool:
+    """Return True if n is a power of two."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _pot_nearest(n: int) -> int:
+    """Return the nearest power of two to n (rounds to closest)."""
+    if _is_pot(n):
+        return n
+    lo = 1 << (n.bit_length() - 1)
+    hi = lo << 1
+    return lo if (n - lo) <= (hi - n) else hi
+
+
+def _pot_next(n: int) -> int:
+    """Return the smallest power of two >= n."""
+    if _is_pot(n):
+        return n
+    return 1 << n.bit_length()
+
+
+
+def _height_to_normal_map(img: Image.Image, strength: float = 4.0, opengl: bool = False) -> Image.Image:
+    """Convert a greyscale heightmap to a tangent-space normal map.
+
+    Uses numpy for fast gradient computation if available;
+    falls back to a pure-Pillow central-difference loop otherwise.
+    DirectX convention: G channel Y+ (default). OpenGL: G channel Y-.
+    """
+    gray = img.convert("L")
+    w, h = gray.size
+    try:
+        import numpy as np
+        arr = np.array(gray, dtype=np.float32) / 255.0
+        dx  = np.gradient(arr, axis=1) * strength
+        dy  = np.gradient(arr, axis=0) * strength
+        if opengl:
+            dy = -dy
+        mag = np.sqrt(dx * dx + dy * dy + 1.0)
+        nx  = (-dx / mag * 0.5 + 0.5) * 255.0
+        ny  = (-dy / mag * 0.5 + 0.5) * 255.0
+        nz  = ( 1.0 / mag * 0.5 + 0.5) * 255.0
+        rgb = np.stack([nx, ny, nz], axis=2).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(rgb, "RGB")
+    except ImportError:
+        # Pure-Pillow fallback — central differences per pixel
+        pixels = list(gray.getdata())
+        s = strength / 4.0
+        r_out, g_out, b_out = [], [], []
+        for y_ in range(h):
+            for x_ in range(w):
+                xm = pixels[y_ * w + max(0, x_ - 1)]
+                xp = pixels[y_ * w + min(w - 1, x_ + 1)]
+                ym = pixels[max(0, y_ - 1) * w + x_]
+                yp = pixels[min(h - 1, y_ + 1) * w + x_]
+                dx_v = (xp - xm) / 255.0 * s
+                dy_v = (yp - ym) / 255.0 * s
+                if opengl:
+                    dy_v = -dy_v
+                mag_v = (dx_v * dx_v + dy_v * dy_v + 1.0) ** 0.5
+                r_out.append(min(255, max(0, int((-dx_v / mag_v * 0.5 + 0.5) * 255))))
+                g_out.append(min(255, max(0, int((-dy_v / mag_v * 0.5 + 0.5) * 255))))
+                b_out.append(min(255, max(0, int(( 1.0 / mag_v * 0.5 + 0.5) * 255))))
+        result = Image.new("RGB", (w, h))
+        result.putdata(list(zip(r_out, g_out, b_out)))
+        return result
+
+
+# =========================
 # TOOLTIP
 # =========================
 class _Tooltip:
@@ -292,15 +363,21 @@ class DDSConverterApp:
         self.root = root
         self.root.configure(bg=COLORS["bg"])
 
-        # Start fullscreen
+        # Start fullscreen — use the desktop work area (excludes the taskbar)
+        # so the bottom of the UI isn't drawn underneath it.
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
-        w, h = sw, sh
-        x, y = 0, 0
+        _wa = self._work_area(hwnd=None)
+        if _wa:
+            x, y, w, h = _wa
+        else:
+            w, h = sw, sh
+            x, y = 0, 0
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.minsize(1100, 660)
         self.root.overrideredirect(True)
         self._maximized = True
+        self._resize_edge = None
 
         # Load window icon
         self._icon_photo_small = None
@@ -329,9 +406,19 @@ class DDSConverterApp:
         # internals for watch/queue
         self._watched_files = set()
         self._pending_watch_files = []
+        self._watch_lock = threading.Lock()
         self.output_type   = tk.StringVar(value="DDS")
         self.mip_maps      = tk.BooleanVar(value=True)
+        self.mip_count     = tk.IntVar(value=0)
+        self._preserve_alpha = tk.BooleanVar(value=True)
+        self._pow2_mode      = tk.StringVar(value="Warn only")
+        self._resize_mode    = tk.StringVar(value="Off")
+        self._resize_value   = tk.IntVar(value=50)
+        self._resize_filter  = tk.StringVar(value="Lanczos")
+        self._alpha_op       = tk.StringVar(value="Off")
+        self._file_alpha_ops: dict = {}
         self.jpeg_quality  = tk.IntVar(value=90)
+        self.webp_quality  = tk.IntVar(value=80)
 
         # tint per-file store
         self._file_tints: dict = {}          # fname → {color, intensity, mode}
@@ -342,6 +429,8 @@ class DDSConverterApp:
         self._tint_intensity = tk.DoubleVar(value=40.0)
         self._tint_mode      = tk.StringVar(value="Multiply")
         self._selected_file  = None
+        self._tint_undo_stack: list = []   # snapshots for Ctrl+Z undo
+        self._filter_var     = tk.StringVar()
 
         # Preview system state
         self._preview_zoom = tk.StringVar(value="Fit")
@@ -360,10 +449,61 @@ class DDSConverterApp:
         self._load_settings()
         self._build_styles()
         self._build_ui()
+        if self._settings_load_errors:
+            self._log("warn", f"Settings: {len(self._settings_load_errors)} field(s) "
+                               f"failed to load, using defaults: {', '.join(self._settings_load_errors)}")
+        self.root.bind("<Control-z>", lambda e: self._undo_tint())
         self.root.after(100, self._apply_win32_style)
         self.root.after(350, self._maybe_show_info)
         if self.input_folder.get():
             self.root.after(50, self.load_files)
+
+    # ─────────────────────────────────────────
+    # WORK-AREA MEASUREMENT
+    # ─────────────────────────────────────────
+    def _get_hwnd(self):
+        """Real Win32 window handle for the root window (needed to ask
+        Windows which monitor it's currently on)."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            self.root.update_idletasks()
+            return ctypes.windll.user32.GetParent(self.root.winfo_id())
+        except Exception:
+            return None
+
+    def _work_area(self, hwnd=None):
+        """Return (x, y, width, height) of the taskbar-free work area — the
+        monitor hwnd is currently on, or the primary monitor if hwnd is
+        None. Verified to agree exactly with Tk's own winfo_screenwidth/
+        height on this DPI-virtualization setup, so it's safe to feed
+        straight into root.geometry().
+        """
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            if hwnd:
+                class MONITORINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+                MONITOR_DEFAULTTONEAREST = 2
+                hmon = ctypes.windll.user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                mi = MONITORINFO()
+                mi.cbSize = ctypes.sizeof(MONITORINFO)
+                if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    r = mi.rcWork
+                    return r.left, r.top, r.right - r.left, r.bottom - r.top
+            else:
+                rect = wintypes.RECT()
+                SPI_GETWORKAREA = 0x0030
+                ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+                return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+        return None
 
     # ─────────────────────────────────────────
     # STYLES
@@ -441,9 +581,8 @@ class DDSConverterApp:
             GWL_EXSTYLE      = -20
             WS_EX_APPWINDOW  = 0x00040000
             WS_EX_TOOLWINDOW = 0x00000080
-            self.root.update_idletasks()
             # swap toolwindow -> appwindow so overrideredirect windows appear in taskbar
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            hwnd = self._get_hwnd()
             style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
@@ -527,8 +666,8 @@ class DDSConverterApp:
             if z == "Fit":
                 # try to fit into label size, fallback to 320x260
                 lbl = box._img_label
-                w = lbl.winfo_width() or 320
-                h = lbl.winfo_height() or 260
+                w = lbl.winfo_width() if lbl.winfo_width() > 1 else 320
+                h = lbl.winfo_height() if lbl.winfo_height() > 1 else 260
                 img_fit = img_disp.copy()
                 img_fit.thumbnail((w-8, h-8), Image.LANCZOS)
                 out_img = img_fit
@@ -539,12 +678,20 @@ class DDSConverterApp:
                 out_img = img_disp.copy().resize((max(1,int(ow*factor)), max(1,int(oh*factor))), Image.LANCZOS)
 
             photo = ImageTk.PhotoImage(out_img)
-            box._img_label.config(image=photo, text="")
-            box._img_label._photo = photo
+            _cv = box._img_label
+            _cv.delete("all")
+            _cw = _cv.winfo_width() if _cv.winfo_width() > 1 else 320
+            _ch = _cv.winfo_height() if _cv.winfo_height() > 1 else 260
+            _cv.create_image(_cw // 2, _ch // 2, anchor="center", image=photo)
+            _cv._photo = photo
             box._info_label.config(text=f"{img.size[0]}×{img.size[1]}px  •  {size_bytes/1024:.1f} KB  •  {img.mode}  •  MIP {level}")
         except Exception as e:
             # render error in preview and log
-            box._img_label.config(image="", text=f"⚠ {e}", fg=COLORS['warn'], compound='center')
+            _cv = box._img_label
+            _cv.delete("all")
+            _cv.create_text((_cv.winfo_width() or 320) // 2, (_cv.winfo_height() or 260) // 2,
+                            text=f"⚠ {e}", fill=COLORS['warn'], font=FONT_UI, anchor="center")
+            _cv._photo = None
             self._log("warn", f"Preview error: {e}")
 
     # ─────────────────────────────────────────
@@ -708,7 +855,7 @@ class DDSConverterApp:
         _min_btn.pack(side="right")
         self._tip(_min_btn, "Minimize to taskbar")
 
-        tk.Label(tb, text=" v7.0 ", fg="#000", bg=COLORS["accent"],
+        tk.Label(tb, text=" v8.0 ", fg="#000", bg=COLORS["accent"],
                  font=("Consolas", 7, "bold")).pack(side="right", padx=(0, 6), pady=9)
 
         _info_btn = tk.Button(tb, text=" ℹ ", bg=COLORS["info"], fg="#fff",
@@ -751,9 +898,13 @@ class DDSConverterApp:
             self._maximized = False
         else:
             self._restore_geo = self.root.geometry()
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            self.root.geometry(f"{sw}x{sh}+0+0")
+            _wa = self._work_area(hwnd=self._get_hwnd())
+            if _wa:
+                x, y, w, h = _wa
+            else:
+                w, h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+                x, y = 0, 0
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
             self._max_btn.config(text=" ❐ ")
             self._maximized = True
 
@@ -783,44 +934,61 @@ class DDSConverterApp:
     # ─────────────────────────────────────────
     def _load_settings(self):
         global COLORS
+        self._settings_load_errors = []
         try:
             with open(SETTINGS_FILE) as f:
                 data = json.load(f)
-            if "colors" in data:
-                COLORS.update(data["colors"])
-            if "theme" in data:
-                self._current_theme = data["theme"]
-            if "show_info_on_start" in data:
-                self._show_info_on_start = data["show_info_on_start"]
-            if "output_type" in data:
-                self.output_type.set(data["output_type"])
-            if "jpeg_quality" in data:
-                self.jpeg_quality.set(int(data["jpeg_quality"]))
-            if "dds_mode" in data:
-                # tolerate older simple values as well as full labels
-                self.dds_mode.set(data["dds_mode"])
-            if "preset" in data:
-                self.preset.set(data["preset"])
-            if data.get("input_folder") and os.path.isdir(data["input_folder"]):
-                self.input_folder.set(data["input_folder"])
-            if data.get("output_folder"):
-                self.output_folder.set(data["output_folder"])
-            if "overwrite_mode" in data:
-                self.overwrite_mode.set(data["overwrite_mode"])
-            if "watch_mode" in data:
-                self.watch_mode.set(bool(data["watch_mode"]))
-            if "workers" in data:
-                try: self._workers.set(int(data.get("workers", 1)))
-                except Exception: pass
-            if "use_gpu" in data:
-                try: self._use_gpu.set(bool(data.get("use_gpu", False)))
-                except Exception: pass
-            if "rename_prefix" in data:
-                self._rename_prefix.set(data.get("rename_prefix", ""))
-            if "rename_suffix" in data:
-                self._rename_suffix.set(data.get("rename_suffix", ""))
         except Exception:
-            pass
+            return
+
+        def _restore(key, fn):
+            """Apply one setting independently — a bad value here must not
+            block every field that would have been restored after it."""
+            if key not in data and key not in ("input_folder", "output_folder"):
+                return
+            try:
+                fn()
+            except Exception as e:
+                self._settings_load_errors.append(key)
+
+        def _apply_colors():
+            bad = []
+            for k, v in data["colors"].items():
+                if k not in COLORS:
+                    continue
+                try:
+                    self.root.winfo_rgb(v)  # raises TclError on an invalid color string
+                    COLORS[k] = v
+                except Exception:
+                    bad.append(k)
+            if bad:
+                raise ValueError(f"invalid color value(s) for: {', '.join(bad)}")
+        _restore("colors", _apply_colors)
+        _restore("theme",              lambda: setattr(self, "_current_theme", data["theme"]))
+        _restore("show_info_on_start", lambda: setattr(self, "_show_info_on_start", data["show_info_on_start"]))
+        _restore("output_type",        lambda: self.output_type.set(data["output_type"]))
+        _restore("jpeg_quality",       lambda: self.jpeg_quality.set(int(data["jpeg_quality"])))
+        _restore("webp_quality",       lambda: self.webp_quality.set(int(data["webp_quality"])))
+        _restore("mip_count",          lambda: self.mip_count.set(int(data["mip_count"])))
+        _restore("preserve_alpha",     lambda: self._preserve_alpha.set(bool(data["preserve_alpha"])))
+        _restore("pow2_mode",          lambda: self._pow2_mode.set(data["pow2_mode"]))
+        _restore("resize_mode",        lambda: self._resize_mode.set(data["resize_mode"]))
+        _restore("resize_value",       lambda: self._resize_value.set(int(data["resize_value"])))
+        _restore("resize_filter",      lambda: self._resize_filter.set(data["resize_filter"]))
+        _restore("alpha_op",           lambda: self._alpha_op.set(data["alpha_op"]))
+        # tolerate older simple values as well as full labels
+        _restore("dds_mode",           lambda: self.dds_mode.set(data["dds_mode"]))
+        _restore("preset",             lambda: self.preset.set(data["preset"]))
+        _restore("input_folder",       lambda: self.input_folder.set(data["input_folder"])
+                                        if data.get("input_folder") and os.path.isdir(data["input_folder"]) else None)
+        _restore("output_folder",      lambda: self.output_folder.set(data["output_folder"])
+                                        if data.get("output_folder") else None)
+        _restore("overwrite_mode",     lambda: self.overwrite_mode.set(data["overwrite_mode"]))
+        _restore("watch_mode",         lambda: self.watch_mode.set(bool(data["watch_mode"])))
+        _restore("workers",            lambda: self._workers.set(int(data.get("workers", 1))))
+        _restore("use_gpu",            lambda: self._use_gpu.set(bool(data.get("use_gpu", False))))
+        _restore("rename_prefix",      lambda: self._rename_prefix.set(data.get("rename_prefix", "")))
+        _restore("rename_suffix",      lambda: self._rename_suffix.set(data.get("rename_suffix", "")))
 
     def _save_settings(self, silent=False):
         data = {"theme": self._current_theme, "colors": dict(COLORS),
@@ -831,6 +999,14 @@ class DDSConverterApp:
                 "overwrite_mode": self.overwrite_mode.get(),
                 "watch_mode": bool(self.watch_mode.get()),
                 "jpeg_quality": self.jpeg_quality.get(),
+                "webp_quality": self.webp_quality.get(),
+                "mip_count": int(self.mip_count.get()),
+                "preserve_alpha": bool(self._preserve_alpha.get()),
+                "pow2_mode": self._pow2_mode.get(),
+                "resize_mode": self._resize_mode.get(),
+                "resize_value": int(self._resize_value.get()),
+                "resize_filter": self._resize_filter.get(),
+                "alpha_op": self._alpha_op.get(),
                 "workers": int(self._workers.get()),
                 "use_gpu": bool(self._use_gpu.get()),
                 "rename_prefix": self._rename_prefix.get(),
@@ -1071,7 +1247,7 @@ class DDSConverterApp:
                 # Auto chooses DXT1/DXT5 per-file; format control is disabled
                 self._dds_format_cb.config(state="disabled", values=["Auto (DXT1/DXT5)"])
                 self.format.set("Auto")
-            if hasattr(self, "after_frame"):
+            if hasattr(self, "after_frame") and self.after_frame.winfo_exists():
                 self.after_frame._title_label.config(text=f"AFTER  [ {self._get_out_ext()} ]")
         self.dds_mode.trace_add("write", _on_dds_mode_change)
         _on_dds_mode_change()
@@ -1103,14 +1279,29 @@ class DDSConverterApp:
                  fg=COLORS["subtext"], bg=COLORS["bg"],
                  font=("Segoe UI", 7, "italic")).pack(side="left")
 
+        self._webp_quality_frame = tk.Frame(row2, bg=COLORS["bg"])
+        tk.Label(self._webp_quality_frame, text="WEBP QUALITY", fg=COLORS["subtext"],
+                 bg=COLORS["bg"], font=FONT_TITLE).pack(side="left", padx=(10, 4))
+        tk.Spinbox(self._webp_quality_frame, from_=1, to=100,
+                   textvariable=self.webp_quality, width=4,
+                   bg=COLORS["input_bg"], fg=COLORS["text"],
+                   insertbackground=COLORS["accent"],
+                   buttonbackground=COLORS["border"],
+                   relief="flat", font=FONT_UI).pack(side="left", padx=(0, 6))
+        tk.Label(self._webp_quality_frame,
+                 text="100=lossless  80=default  60=web  40=small",
+                 fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=("Segoe UI", 7, "italic")).pack(side="left")
+
         self.start_btn = self._btn(row2, "▶  START CONVERSION",
                                    self.start_thread, COLORS["accent"], fg="#000", padx=14)
         self.start_btn.pack(side="right")
         self._tip(self.start_btn, "Begin converting all files in the queue with the current settings")
 
         def _on_output_type_change(*_):
-            is_dds = self.output_type.get() == "DDS"
-            is_jpg = self.output_type.get() in ("JPG", "JPEG")
+            is_dds  = self.output_type.get() == "DDS"
+            is_jpg  = self.output_type.get() in ("JPG", "JPEG")
+            is_webp = self.output_type.get() == "WebP"
             # respect DDS mode: Auto disables manual format selection
             if is_dds:
                 if self.dds_mode.get().startswith("Auto"):
@@ -1120,11 +1311,20 @@ class DDSConverterApp:
             else:
                 self._dds_format_cb.config(state="disabled")
             self._mip_check.config(state="normal" if is_dds else "disabled")
+            if hasattr(self, "_mip_count_spin"):
+                self._mip_count_spin.config(
+                    state="normal" if is_dds and self.mip_maps.get() else "disabled")
+            if hasattr(self, "_preserve_alpha_ck"):
+                self._preserve_alpha_ck.config(state="normal" if is_dds else "disabled")
             if is_jpg:
                 self._quality_frame.pack(side="left", after=self._mip_check)
             else:
                 self._quality_frame.pack_forget()
-            if hasattr(self, "after_frame"):
+            if is_webp:
+                self._webp_quality_frame.pack(side="left", after=self._mip_check)
+            else:
+                self._webp_quality_frame.pack_forget()
+            if hasattr(self, "after_frame") and self.after_frame.winfo_exists():
                 self.after_frame._title_label.config(
                     text=f"AFTER  [ {self._get_out_ext()} ]")
         self.output_type.trace_add("write", _on_output_type_change)
@@ -1148,6 +1348,19 @@ class DDSConverterApp:
         _gpu_ck.pack(side="left", padx=(8,0))
         self._tip(_gpu_ck, "Use texconv_gpu.exe for GPU-accelerated block compression. "
                            "Requires the GPU-enabled build placed next to the app. Falls back to CPU if not found.")
+        tk.Label(perf_row, text="POW-2", fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=FONT_TITLE).pack(side="left", padx=(14, 0))
+        self._pow2_cb = ttk.Combobox(perf_row, textvariable=self._pow2_mode, state="readonly",
+                                     font=FONT_UI, width=22,
+                                     values=["Off", "Warn only",
+                                             "Auto-resize (nearest)", "Auto-resize (next \u2191)"])
+        self._pow2_cb.pack(side="left", padx=6)
+        self._tip(self._pow2_cb,
+                  "Power-of-two dimension check. Most engines require POT (512, 1024, 2048\u2026).\n"
+                  "Off = no check.\n"
+                  "Warn only = logs a warning if dimensions are not POT.\n"
+                  "Auto-resize (nearest) = rounds each dimension to nearest POT.\n"
+                  "Auto-resize (next \u2191) = rounds each dimension up to next POT.")
 
 
         # Project / Template row (modding tool feel)
@@ -1163,8 +1376,11 @@ class DDSConverterApp:
         def _on_template_change(*_):
             val = self._template_var.get()
             if val and val != "(none)":
+                self._template_var.trace_remove("write", self._template_trace_id)
                 self._apply_template(val)
-        self._template_var.trace_add("write", _on_template_change)
+                self._template_var.set("(none)")
+                self._template_trace_id = self._template_var.trace_add("write", _on_template_change)
+        self._template_trace_id = self._template_var.trace_add("write", _on_template_change)
 
         _save_proj = self._btn(proj_row, "💾 SAVE PROJECT", self._save_project, COLORS["accent"])
         _save_proj.pack(side="right", padx=4)
@@ -1194,6 +1410,40 @@ class DDSConverterApp:
         tk.Label(rename_row, text="added to each output filename before extension",
                  fg=COLORS["subtext"], bg=COLORS["bg"],
                  font=("Segoe UI", 7, "italic")).pack(side="left", padx=8)
+
+        resize_row = tk.Frame(toolbar, bg=COLORS["bg"]); resize_row.pack(fill="x", pady=2)
+        tk.Label(resize_row, text="BATCH RESIZE", fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=FONT_TITLE, width=13, anchor="e").pack(side="left")
+        self._resize_mode_cb = ttk.Combobox(resize_row, textvariable=self._resize_mode,
+                                             state="readonly", font=FONT_UI, width=14,
+                                             values=["Off", "Scale %", "Max side (px)"])
+        self._resize_mode_cb.pack(side="left", padx=6)
+        self._tip(self._resize_mode_cb,
+                  "Resize images before conversion.\n"
+                  "Scale % = resize to this percentage of original (50 = half size).\n"
+                  "Max side = shrink so the longest dimension = this many pixels (never upscales).")
+        self._resize_spin = tk.Spinbox(resize_row, textvariable=self._resize_value,
+                                       from_=1, to=8192, width=6,
+                                       bg=COLORS["input_bg"], fg=COLORS["text"],
+                                       insertbackground=COLORS["accent"],
+                                       buttonbackground=COLORS["border"],
+                                       relief="flat", font=FONT_UI)
+        self._resize_spin.pack(side="left", padx=(0, 6))
+        self._tip(self._resize_spin,
+                  "Resize value.\n"
+                  "Scale % mode: 50 = half size, 200 = double size.\n"
+                  "Max side mode: 1024 = longest edge capped at 1024 px.")
+        tk.Label(resize_row, text="Filter:", fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=FONT_UI).pack(side="left", padx=(4, 2))
+        self._resize_filter_cb = ttk.Combobox(resize_row, textvariable=self._resize_filter,
+                                               state="readonly", font=FONT_UI, width=10,
+                                               values=["Lanczos", "Box", "Bicubic"])
+        self._resize_filter_cb.pack(side="left", padx=(0, 6))
+        self._tip(self._resize_filter_cb,
+                  "Resampling filter used for resize.\n"
+                  "Lanczos = highest quality (best for downscaling).\n"
+                  "Box = fast, good for simple downscaling.\n"
+                  "Bicubic = smooth, good for upscaling.")
 
         tk.Frame(self.root, bg=COLORS["border"], height=1).pack(fill="x")
 
@@ -1258,6 +1508,12 @@ class DDSConverterApp:
 
         # ── Canvas / file list fills remaining space between header and bottom controls ──
         lf = tk.Frame(sidebar, bg=COLORS["sidebar"]); lf.pack(fill="both", expand=True, padx=4, pady=4)
+        _fe = tk.Entry(lf, bg=COLORS["input_bg"],
+                       fg=COLORS["subtext"], insertbackground=COLORS["accent"],
+                       relief="flat", font=FONT_MONO)
+        _fe.pack(fill="x", pady=(0, 2))
+        self._setup_placeholder(_fe, self._filter_var, "filter files\u2026")
+        self._filter_var.trace_add("write", lambda *_: self._apply_file_filter())
         self._list_canvas = tk.Canvas(lf, bg="#101010", highlightthickness=0)
         self._list_canvas.pack(fill="both", expand=True)
         self._list_inner = tk.Frame(self._list_canvas, bg="#101010")
@@ -1287,6 +1543,17 @@ class DDSConverterApp:
                                    font=("Consolas", 7, "bold"), padx=6, pady=1)
         self.tint_badge.pack(side="left")
 
+        # Bottom controls (zoom row / tint panel / stats) — registered
+        # (packed) BEFORE the expand=True preview area below, so Tk's
+        # packer reserves their space first. Tk's packer carves cavity in
+        # strict pack()-call order regardless of side, so an expand=True
+        # widget packed earlier will starve a fixed-size sibling packed
+        # after it even on the opposite edge — this ordering is required,
+        # not just the side="bottom" option, for the preview area to
+        # shrink first on short screens instead of pushing these off.
+        bottom_controls = tk.Frame(center, bg=COLORS["bg"])
+        bottom_controls.pack(side="bottom", fill="x")
+
         pf = tk.Frame(center, bg=COLORS["bg"])
         pf.pack(fill="both", expand=True, padx=10, pady=4)
         self.before_frame = self._preview_box(pf, "BEFORE  (with tint)")
@@ -1295,7 +1562,7 @@ class DDSConverterApp:
         self.after_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
 
         # Preview controls (zoom / checker / mip)
-        ctrl_row = tk.Frame(center, bg=COLORS["bg"]) ; ctrl_row.pack(fill="x", padx=10)
+        ctrl_row = tk.Frame(bottom_controls, bg=COLORS["bg"]) ; ctrl_row.pack(fill="x", padx=10)
         tk.Label(ctrl_row, text="Zoom:", fg=COLORS["subtext"], bg=COLORS["bg"], font=FONT_TITLE).pack(side="left")
         zoom_cb = ttk.Combobox(ctrl_row, textvariable=self._preview_zoom, state="readonly",
                                values=["Fit","25%","50%","100%","200%"], width=8)
@@ -1319,7 +1586,7 @@ class DDSConverterApp:
         self._mip_label.pack(side="left")
 
         # TINT PANEL
-        tint_outer = tk.Frame(center, bg=COLORS["panel"])
+        tint_outer = tk.Frame(bottom_controls, bg=COLORS["panel"])
         tint_outer.pack(fill="x", padx=10, pady=(0, 4))
 
         th = tk.Frame(tint_outer, bg=COLORS["panel"]); th.pack(fill="x")
@@ -1410,6 +1677,39 @@ class DDSConverterApp:
         tk.Label(fmt_row, text="DDS format override for this file only",
                  fg=COLORS["subtext"], bg=COLORS["panel"],
                  font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
+        _nrm_btn = self._btn(fmt_row, "\U0001f5fa HEIGHT\u2192NORMAL",
+                              self._open_normal_map_dialog, COLORS["border"], fg=COLORS["text"])
+        _nrm_btn.pack(side="right", padx=4)
+        self._tip(_nrm_btn,
+                  "Generate a tangent-space normal map from the selected greyscale heightmap.\n"
+                  "Opens a dialog to set strength and coordinate convention (DirectX / OpenGL).\n"
+                  "numpy recommended for quality; pure-Pillow fallback is always available.")
+
+        # Alpha channel operations
+        alpha_row = tk.Frame(tb, bg=COLORS["panel"]); alpha_row.pack(fill="x", pady=(4, 0))
+        tk.Label(alpha_row, text="ALPHA OP", fg=COLORS["subtext"], bg=COLORS["panel"],
+                 font=FONT_TITLE, width=8, anchor="e").pack(side="left")
+        self._alpha_op_cb = ttk.Combobox(
+            alpha_row, textvariable=self._alpha_op, state="readonly", font=FONT_UI, width=20,
+            values=["Off", "Strip \u03b1 (\u2192RGB)", "Inject white \u03b1",
+                    "Inject black \u03b1", "Extract \u03b1 \u2192file"])
+        self._alpha_op_cb.pack(side="left", padx=6)
+        self._tip(self._alpha_op_cb,
+                  "Global alpha channel operation applied to every file before conversion.\n"
+                  "Strip = remove alpha channel (output becomes solid RGB).\n"
+                  "Inject white/black = add a fully opaque / transparent alpha layer.\n"
+                  "Extract = save alpha as a separate <name>_alpha.png alongside each output.")
+        self._file_alpha_op_var = tk.StringVar(value="(global)")
+        _fa_cb = ttk.Combobox(
+            alpha_row, textvariable=self._file_alpha_op_var, state="readonly",
+            font=FONT_UI, width=13,
+            values=["(global)", "Off", "Strip \u03b1", "White \u03b1", "Black \u03b1", "Extract \u03b1"])
+        _fa_cb.pack(side="left", padx=6)
+        _fa_cb.bind("<<ComboboxSelected>>", lambda e: self._save_file_alpha_op())
+        self._tip(_fa_cb, "Per-file alpha op — overrides the global ALPHA OP for this file only.")
+        tk.Label(alpha_row, text="per-file overrides global",
+                 fg=COLORS["subtext"], bg=COLORS["panel"],
+                 font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
 
         # Progress
         pf2 = tk.Frame(center, bg=COLORS["bg"]); pf2.pack(fill="x", padx=10, pady=(0, 4))
@@ -1424,7 +1724,7 @@ class DDSConverterApp:
         self.pct_bar_lbl.pack(fill="x")
 
         # Stats
-        stats_bar = tk.Frame(center, bg=COLORS["panel"], height=48)
+        stats_bar = tk.Frame(bottom_controls, bg=COLORS["panel"], height=48)
         stats_bar.pack(fill="x", padx=10, pady=(0, 4)); stats_bar.pack_propagate(False)
         self.stat_total  = self._stat_label(stats_bar, "TOTAL",  "0")
         self.stat_done   = self._stat_label(stats_bar, "DONE",   "0", COLORS["done"])
@@ -1442,7 +1742,7 @@ class DDSConverterApp:
         self._tip(_clr_log, "Clear the conversion log panel (does not affect texforge_conversion.log on disk)")
         log_sb2 = tk.Scrollbar(log_outer); log_sb2.pack(side="right", fill="y")
         self.log = tk.Text(log_outer, bg="#0a0a0a", fg=COLORS["text"], font=FONT_MONO,
-                           relief="flat", bd=0, wrap="none", state="disabled", cursor="arrow")
+                           relief="flat", bd=0, wrap="word", state="disabled", cursor="arrow")
         self.log.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.log.config(yscrollcommand=log_sb2.set)
         log_sb2.config(command=self.log.yview)
@@ -1460,6 +1760,66 @@ class DDSConverterApp:
             kw = {"foreground": fg}
             if bold: kw["font"] = ("Consolas", 9, "bold")
             self.log.tag_config(tag, **kw)
+
+        self._build_resize_grips()
+
+    # ─────────────────────────────────────────
+    # MANUAL RESIZE (overrideredirect has no native resize border)
+    # ─────────────────────────────────────────
+    def _build_resize_grips(self):
+        border = 5
+        specs = [
+            ("n",  "size_ns",    dict(relx=0, rely=0, relwidth=1, height=border, anchor="nw")),
+            ("s",  "size_ns",    dict(relx=0, rely=1, relwidth=1, height=border, anchor="sw")),
+            ("w",  "size_we",    dict(relx=0, rely=0, relheight=1, width=border, anchor="nw")),
+            ("e",  "size_we",    dict(relx=1, rely=0, relheight=1, width=border, anchor="ne")),
+            ("nw", "size_nw_se", dict(relx=0, rely=0, width=border, height=border, anchor="nw")),
+            ("se", "size_nw_se", dict(relx=1, rely=1, width=border, height=border, anchor="se")),
+            ("ne", "size_ne_sw", dict(relx=1, rely=0, width=border, height=border, anchor="ne")),
+            ("sw", "size_ne_sw", dict(relx=0, rely=1, width=border, height=border, anchor="sw")),
+        ]
+        for edge, cursor, place_kw in specs:
+            g = tk.Frame(self.root, bg=COLORS["bg"], cursor=cursor)
+            g.place(**place_kw)
+            g.lift()
+            g.bind("<ButtonPress-1>", lambda e, ed=edge: self._resize_start(e, ed))
+            g.bind("<B1-Motion>", self._resize_drag)
+            g.bind("<ButtonRelease-1>", self._resize_end)
+
+    def _resize_start(self, event, edge):
+        if self._maximized:
+            return
+        self._resize_edge = edge
+        self._resize_start_x = event.x_root
+        self._resize_start_y = event.y_root
+        self._resize_start_geo = (self.root.winfo_x(), self.root.winfo_y(),
+                                   self.root.winfo_width(), self.root.winfo_height())
+
+    def _resize_drag(self, event):
+        if self._maximized or not self._resize_edge:
+            return
+        dx = event.x_root - self._resize_start_x
+        dy = event.y_root - self._resize_start_y
+        x0, y0, w0, h0 = self._resize_start_geo
+        min_w, min_h = self.root.minsize()
+        x, y, w, h = x0, y0, w0, h0
+        edge = self._resize_edge
+        if "e" in edge:
+            w = max(min_w, w0 + dx)
+        if "s" in edge:
+            h = max(min_h, h0 + dy)
+        if "w" in edge:
+            neww = max(min_w, w0 - dx)
+            x = x0 + (w0 - neww)
+            w = neww
+        if "n" in edge:
+            newh = max(min_h, h0 - dy)
+            y = y0 + (h0 - newh)
+            h = newh
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _resize_end(self, event):
+        self._resize_edge = None
 
     # ─────────────────────────────────────────
     # HELPERS
@@ -1480,8 +1840,10 @@ class DDSConverterApp:
                              font=FONT_TITLE)
         title_lbl.pack(pady=(6, 2))
         frame._title_label = title_lbl
-        lbl = tk.Label(frame, bg="#0d0d0d"); lbl.pack(fill="both", expand=True, padx=6, pady=(0, 2))
-        frame._img_label  = lbl
+        canvas = tk.Canvas(frame, bg="#0d0d0d", highlightthickness=0)
+        canvas.pack(fill="both", expand=True, padx=6, pady=(0, 2))
+        canvas._photo = None
+        frame._img_label  = canvas
         frame._info_label = tk.Label(frame, text="", fg=COLORS["subtext"],
                                      bg=COLORS["panel"], font=FONT_MONO)
         frame._info_label.pack(pady=(0, 4))
@@ -1578,6 +1940,7 @@ class DDSConverterApp:
             "jpeg_quality": int(self.jpeg_quality.get()),
             "file_tints": self._file_tints,
             "file_formats": self._file_formats,
+            "file_alpha_ops": self._file_alpha_ops,
             "rename_prefix": self._rename_prefix.get(),
             "rename_suffix": self._rename_suffix.get(),
         }
@@ -1626,6 +1989,8 @@ class DDSConverterApp:
                 self._file_tints = data.get("file_tints") or {}
             if "file_formats" in data:
                 self._file_formats = data.get("file_formats") or {}
+            if "file_alpha_ops" in data:
+                self._file_alpha_ops = data.get("file_alpha_ops") or {}
             if "rename_prefix" in data:
                 self._rename_prefix.set(data.get("rename_prefix", ""))
             if "rename_suffix" in data:
@@ -1637,12 +2002,92 @@ class DDSConverterApp:
         except Exception as e:
             self._log("warn", f"Could not apply project settings: {e}")
 
+    def _ask_template_names(self, template_name: str, default_inp: str, default_out: str):
+        """Show a small modal asking for custom input/output subfolder names.
+        Returns (inp_name, out_name) or (None, None) if cancelled."""
+        result = [None, None]
+
+        win = tk.Toplevel(self.root)
+        win.configure(bg=COLORS["bg"])
+        win.overrideredirect(True)
+        win.grab_set()
+
+        w, h = 400, 200
+        rx = self.root.winfo_x() + (self.root.winfo_width()  - w) // 2
+        ry = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{rx}+{ry}")
+
+        # title bar
+        hdr = tk.Frame(win, bg=COLORS["panel"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"📁  TEMPLATE — {template_name}",
+                 fg=COLORS["accent"], bg=COLORS["panel"],
+                 font=("Consolas", 10, "bold")).pack(side="left", padx=12, pady=8)
+        tk.Button(hdr, text=" ✕ ", bg=COLORS["panel"], fg=COLORS["text"],
+                  relief="flat", font=("Segoe UI", 10, "bold"),
+                  activebackground=COLORS["error"], activeforeground="#fff",
+                  cursor="hand2", bd=0, command=win.destroy).pack(side="right")
+        tk.Frame(win, bg=COLORS["border"], height=1).pack(fill="x")
+
+        body = tk.Frame(win, bg=COLORS["bg"])
+        body.pack(fill="both", expand=True, padx=16, pady=10)
+
+        for row_lbl, default in [("INPUT subfolder", default_inp),
+                                  ("OUTPUT subfolder", default_out)]:
+            r = tk.Frame(body, bg=COLORS["bg"]); r.pack(fill="x", pady=4)
+            tk.Label(r, text=row_lbl, fg=COLORS["subtext"], bg=COLORS["bg"],
+                     font=FONT_TITLE, width=16, anchor="e").pack(side="left")
+            e = tk.Entry(r, bg=COLORS["input_bg"], fg=COLORS["text"],
+                         insertbackground=COLORS["accent"], relief="flat",
+                         font=FONT_UI, bd=4)
+            e.insert(0, default)
+            e.pack(side="left", fill="x", expand=True, padx=(6, 0))
+            if row_lbl.startswith("INPUT"):
+                inp_entry = e
+            else:
+                out_entry = e
+
+        tk.Frame(win, bg=COLORS["border"], height=1).pack(fill="x")
+        btn_row = tk.Frame(win, bg=COLORS["panel"]); btn_row.pack(fill="x", pady=6)
+
+        def _ok():
+            inp_val = inp_entry.get().strip()
+            out_val = out_entry.get().strip()
+            if not inp_val or not out_val:
+                return
+            result[0] = inp_val
+            result[1] = out_val
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        tk.Button(btn_row, text="✔  CREATE", bg=COLORS["accent"], fg="#000",
+                  relief="flat", font=FONT_TITLE, padx=12, pady=4,
+                  cursor="hand2", command=_ok).pack(side="left", padx=10)
+        tk.Button(btn_row, text="✕  CANCEL", bg=COLORS["border"], fg=COLORS["warn"],
+                  relief="flat", font=FONT_TITLE, padx=12, pady=4,
+                  cursor="hand2", command=_cancel).pack(side="right", padx=10)
+
+        inp_entry.bind("<Return>", lambda e: _ok())
+        out_entry.bind("<Return>", lambda e: _ok())
+        win.bind("<Escape>", lambda e: _cancel())
+        inp_entry.focus_set()
+
+        self.root.wait_window(win)
+        return result[0], result[1]
+
     def _apply_template(self, name: str):
         t = FOLDER_TEMPLATES.get(name)
         if not t:
             return
-        inp = os.path.join(APP_DIR, "projects", t["input_sub"])
-        out = os.path.join(APP_DIR, "projects", t["output_sub"])
+        inp_name, out_name = self._ask_template_names(
+            name, t["input_sub"], t["output_sub"])
+        if not inp_name:
+            # user cancelled — combobox reset is handled by the caller
+            return
+        inp = os.path.join(APP_DIR, "projects", inp_name)
+        out = os.path.join(APP_DIR, "projects", out_name)
         try:
             os.makedirs(inp, exist_ok=True)
             os.makedirs(out, exist_ok=True)
@@ -1672,6 +2117,7 @@ class DDSConverterApp:
         lbl.pack(side="left", fill="x", expand=True)
         for w in [row, lbl]:
             w.bind("<Button-1>", lambda e, f=fname: self._select_file_row(f))
+            w.bind("<Button-3>", lambda e, f=fname: self._file_row_context_menu(e, f))
         for w in [row, lbl, btn]:
             w.bind("<MouseWheel>", lambda e: self._list_canvas.yview_scroll(
                 -1 * (e.delta // 120), "units"))
@@ -1687,6 +2133,137 @@ class DDSConverterApp:
             self._row_labels[fname].config(bg=COLORS["accent2"], fg="#fff")
         self._refresh_list_colors()
         self._on_file_select(fname)
+
+    def _file_row_context_menu(self, event, fname):
+        menu = tk.Menu(self.root, tearoff=0,
+                       bg=COLORS["panel"], fg=COLORS["text"],
+                       activebackground=COLORS["accent2"], activeforeground="#fff",
+                       font=FONT_UI, bd=0, relief="flat")
+        menu.add_command(label="\u25b6  Convert this file",
+                         command=lambda: self._convert_single(fname))
+        menu.add_separator()
+        src_path = os.path.join(self.input_folder.get(), fname) if self.input_folder.get() else ""
+        if src_path and os.path.exists(src_path):
+            menu.add_command(label="\U0001f4c2  Reveal source in Explorer",
+                             command=lambda p=src_path: self._reveal_in_explorer(p))
+        if self.output_folder.get():
+            out_path = os.path.join(self.output_folder.get(),
+                                    os.path.splitext(fname)[0] + self._get_out_ext())
+            if os.path.exists(out_path):
+                menu.add_command(label="\U0001f4c2  Reveal output in Explorer",
+                                 command=lambda p=out_path: self._reveal_in_explorer(p))
+        menu.add_separator()
+        menu.add_command(label="\u2716  Remove from queue",
+                         command=lambda: (self._select_file_row(fname), self._remove_selected()),
+                         foreground=COLORS["warn"])
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _reveal_in_explorer(self, path: str):
+        """Select a file in the OS file manager."""
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except Exception as e:
+            self._log("warn", f"Open in Explorer failed: {e}")
+
+    def _open_normal_map_dialog(self):
+        """Open the height-to-normal-map generator dialog for the selected file."""
+        if not self._selected_file or not self.input_folder.get():
+            messagebox.showinfo("Normal Map", "Select a file from the queue first.")
+            return
+        src = os.path.join(self.input_folder.get(), self._selected_file)
+        if not os.path.exists(src):
+            messagebox.showinfo("Normal Map", f"Source file not found:\n{src}")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.configure(bg=COLORS["bg"])
+        win.overrideredirect(True)
+        win.grab_set()
+        dw, dh = 480, 270
+        rx = self.root.winfo_x() + (self.root.winfo_width()  - dw) // 2
+        ry = self.root.winfo_y() + (self.root.winfo_height() - dh) // 2
+        win.geometry(f"{dw}x{dh}+{rx}+{ry}")
+
+        hdr = tk.Frame(win, bg=COLORS["panel"]); hdr.pack(fill="x")
+        tk.Label(hdr, text="\U0001f5fa  HEIGHT \u2192 NORMAL MAP",
+                 fg=COLORS["accent"], bg=COLORS["panel"],
+                 font=("Consolas", 10, "bold")).pack(side="left", padx=12, pady=8)
+        tk.Button(hdr, text=" \u2715 ", bg=COLORS["panel"], fg=COLORS["text"],
+                  relief="flat", font=("Segoe UI", 10, "bold"),
+                  activebackground=COLORS["error"], activeforeground="#fff",
+                  cursor="hand2", bd=0, command=win.destroy).pack(side="right")
+        tk.Frame(win, bg=COLORS["border"], height=1).pack(fill="x")
+
+        body = tk.Frame(win, bg=COLORS["bg"]); body.pack(fill="both", expand=True, padx=16, pady=10)
+        tk.Label(body, text=f"Source: {self._selected_file}",
+                 fg=COLORS["subtext"], bg=COLORS["bg"], font=FONT_MONO).pack(anchor="w", pady=(0, 8))
+
+        _strength = tk.DoubleVar(value=4.0)
+        sr = tk.Frame(body, bg=COLORS["bg"]); sr.pack(fill="x", pady=4)
+        tk.Label(sr, text="Strength:", fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=FONT_TITLE, width=12, anchor="e").pack(side="left")
+        _sv = tk.Label(sr, text="4.0", fg=COLORS["accent"], bg=COLORS["bg"],
+                       font=FONT_MONO, width=5)
+        _sv.pack(side="right")
+        _sl = ttk.Scale(sr, from_=0.5, to=20.0, orient="horizontal",
+                        variable=_strength, length=250,
+                        command=lambda v: _sv.config(text=f"{float(v):.1f}"))
+        _sl.pack(side="left", padx=(8, 4), fill="x", expand=True)
+
+        _conv = tk.StringVar(value="DirectX (Y+)")
+        cr = tk.Frame(body, bg=COLORS["bg"]); cr.pack(fill="x", pady=4)
+        tk.Label(cr, text="Convention:", fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=FONT_TITLE, width=12, anchor="e").pack(side="left")
+        ttk.Combobox(cr, textvariable=_conv, state="readonly", width=18, font=FONT_UI,
+                     values=["DirectX (Y+)", "OpenGL (Y-)"]).pack(side="left", padx=8)
+
+        _out_var = tk.StringVar(value=self.output_folder.get() or self.input_folder.get())
+        or_ = tk.Frame(body, bg=COLORS["bg"]); or_.pack(fill="x", pady=4)
+        tk.Label(or_, text="Save to:", fg=COLORS["subtext"], bg=COLORS["bg"],
+                 font=FONT_TITLE, width=12, anchor="e").pack(side="left")
+        tk.Entry(or_, textvariable=_out_var, bg=COLORS["input_bg"], fg=COLORS["text"],
+                 insertbackground=COLORS["accent"], relief="flat",
+                 font=FONT_UI, bd=4).pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        tk.Frame(win, bg=COLORS["border"], height=1).pack(fill="x")
+        btn_row = tk.Frame(win, bg=COLORS["panel"]); btn_row.pack(fill="x", pady=6)
+        status = tk.Label(btn_row, text="", fg=COLORS["subtext"], bg=COLORS["panel"],
+                          font=FONT_MONO)
+        status.pack(side="left", padx=10)
+
+        def _generate():
+            status.config(text="Generating\u2026", fg=COLORS["info"])
+            win.update_idletasks()
+            try:
+                img = Image.open(src)
+                is_opengl = "OpenGL" in _conv.get()
+                nrm = _height_to_normal_map(img, _strength.get(), is_opengl)
+                stem = os.path.splitext(self._selected_file)[0]
+                save_dir = _out_var.get().strip() or self.input_folder.get()
+                os.makedirs(save_dir, exist_ok=True)
+                out_path = os.path.join(save_dir, f"{stem}_nrm.png")
+                nrm.save(out_path)
+                status.config(text=f"\u2714 {os.path.basename(out_path)}", fg=COLORS["done"])
+                self._log("done", f"Normal map saved: {os.path.basename(out_path)}")
+                self.load_files()
+            except Exception as exc:
+                status.config(text=f"\u2718 {exc}", fg=COLORS["fail"])
+                self._log("warn", f"Normal map failed: {exc}")
+
+        tk.Button(btn_row, text="\U0001f5fa  GENERATE", bg=COLORS["accent"], fg="#000",
+                  relief="flat", font=FONT_TITLE, padx=12, pady=4,
+                  cursor="hand2", command=_generate).pack(side="right", padx=10)
+        tk.Button(btn_row, text="\u2715  CLOSE", bg=COLORS["border"], fg=COLORS["warn"],
+                  relief="flat", font=FONT_TITLE, padx=12, pady=4,
+                  cursor="hand2", command=win.destroy).pack(side="right")
 
     # ─────────────────────────────────────────
     # FOLDERS
@@ -1733,6 +2310,7 @@ class DDSConverterApp:
         self.stat_total.config(text=str(len(files)))
         self._log("info", f"Loaded {len(files)} file(s)")
         self._refresh_list_colors()
+        self._apply_file_filter()
 
     # ─────────────────────────────────────────
     # FILE SELECT
@@ -1755,6 +2333,8 @@ class DDSConverterApp:
         self._sync_tint_ui()
         if hasattr(self, "_file_fmt_var"):
             self._file_fmt_var.set(self._file_formats.get(fname, "(global)"))
+        if hasattr(self, "_file_alpha_op_var"):
+            self._file_alpha_op_var.set(self._file_alpha_ops.get(fname, "(global)"))
         self._refresh_before_preview()
         if self.output_folder.get():
             stem     = os.path.splitext(fname)[0]
@@ -1812,6 +2392,12 @@ class DDSConverterApp:
 
     def _save_tint(self):
         if not self._selected_file: return
+        # snapshot current state for undo before any change
+        _snapshot = {k: dict(v) for k, v in self._file_tints.items()}
+        if not self._tint_undo_stack or self._tint_undo_stack[-1] != _snapshot:
+            self._tint_undo_stack.append(_snapshot)
+            if len(self._tint_undo_stack) > 30:
+                self._tint_undo_stack.pop(0)
         hx  = self._tint_color.get()
         pct = self._tint_intensity.get()
         if hx:
@@ -1833,11 +2419,35 @@ class DDSConverterApp:
         else:
             self._file_formats.pop(self._selected_file, None)
 
+    def _save_file_alpha_op(self):
+        if not self._selected_file: return
+        val = self._file_alpha_op_var.get()
+        if val and val != "(global)":
+            self._file_alpha_ops[self._selected_file] = val
+        else:
+            self._file_alpha_ops.pop(self._selected_file, None)
+
     def _clear_tint(self):
         self._tint_color.set("")
         self._sync_tint_ui()
         self._save_tint()
         self._refresh_before_preview()
+
+    def _undo_tint(self):
+        if not self._tint_undo_stack:
+            self._log("info", "Nothing to undo")
+            return
+        self._file_tints = self._tint_undo_stack.pop()
+        if self._selected_file:
+            tint = self._file_tints.get(self._selected_file, {})
+            self._tint_color.set(tint.get("color", ""))
+            self._tint_intensity.set(tint.get("intensity", 0.40) * 100)
+            self._tint_mode.set(tint.get("mode", "Multiply"))
+            self._sync_tint_ui()
+        self._refresh_list_colors()
+        self.stat_tinted.config(text=str(len(self._file_tints)))
+        self._refresh_before_preview()
+        self._log("info", f"Tint undone  ({len(self._tint_undo_stack)} step(s) left)")
 
     def _apply_to_all(self):
         hx  = self._tint_color.get()
@@ -1869,6 +2479,17 @@ class DDSConverterApp:
             else:
                 self._row_labels[fname].config(fg=COLORS["text"])
 
+    def _apply_file_filter(self):
+        """Show/hide queue rows based on the current filter text."""
+        q = self._filter_var.get().strip().lower()
+        for fname in self._file_names:
+            if fname not in self._row_frames:
+                continue
+            if not q or q in fname.lower():
+                self._row_frames[fname].pack(fill="x", pady=1, padx=2)
+            else:
+                self._row_frames[fname].pack_forget()
+
     # ─────────────────────────────────────────
     # PREVIEW
     # ─────────────────────────────────────────
@@ -1886,15 +2507,20 @@ class DDSConverterApp:
             self._update_mip_slider(self._preview_src_img)
             self._render_preview(self._preview_src_img, self.before_frame, os.path.getsize(src))
         except Exception as e:
-            self.before_frame._img_label.config(image="", text=f"⚠ {e}",
-                                                fg=COLORS["warn"], compound="center")
+            _cv = self.before_frame._img_label
+            _cv.delete("all")
+            _cv.create_text((_cv.winfo_width() or 320) // 2, (_cv.winfo_height() or 260) // 2,
+                            text=f"⚠ {e}", fill=COLORS["warn"], font=FONT_UI, anchor="center")
 
     def _show_path(self, path, box):
         if path.lower().endswith(".svg"):
             sz = os.path.getsize(path) / 1024 if os.path.exists(path) else 0
-            box._img_label.config(image="", text="SVG\n(raster embedded)\nno preview",
-                                  fg=COLORS["subtext"], compound="center")
-            box._img_label._photo = None
+            _cv = box._img_label
+            _cv.delete("all")
+            _cv._photo = None
+            _cv.create_text((_cv.winfo_width() or 320) // 2, (_cv.winfo_height() or 260) // 2,
+                            text="SVG\n(raster embedded)\nno preview",
+                            fill=COLORS["subtext"], font=FONT_UI, anchor="center")
             box._info_label.config(text=f"{sz:.1f} KB  •  SVG")
             return
         try:
@@ -1906,21 +2532,30 @@ class DDSConverterApp:
             else:
                 self._render_preview(img, box, os.path.getsize(path))
         except Exception as e:
-            box._img_label.config(image="", text=f"⚠ {e}",
-                                  fg=COLORS["warn"], compound="center")
+            _cv = box._img_label
+            _cv.delete("all")
+            _cv.create_text((_cv.winfo_width() or 320) // 2, (_cv.winfo_height() or 260) // 2,
+                            text=f"⚠ {e}", fill=COLORS["warn"], font=FONT_UI, anchor="center")
 
     def _display(self, img: Image.Image, box, size_bytes=0):
         # legacy simple display — kept for compatibility
         w, h = img.size
         th = img.copy(); th.thumbnail((320, 260))
         photo = ImageTk.PhotoImage(th)
-        box._img_label.config(image=photo, text="")
-        box._img_label._photo = photo
+        _cv = box._img_label
+        _cv.delete("all")
+        _cv.create_image((_cv.winfo_width() or 320) // 2, (_cv.winfo_height() or 260) // 2,
+                         anchor="center", image=photo)
+        _cv._photo = photo
         box._info_label.config(text=f"{w}×{h}px  •  {size_bytes/1024:.1f} KB  •  {img.mode}")
 
     def _clear_preview(self, box, reason=""):
-        box._img_label.config(image="", text=reason, fg=COLORS["subtext"], compound="center")
-        box._img_label._photo = None
+        _cv = box._img_label
+        _cv.delete("all")
+        _cv._photo = None
+        if reason:
+            _cv.create_text((_cv.winfo_width() or 320) // 2, (_cv.winfo_height() or 260) // 2,
+                            text=reason, fill=COLORS["subtext"], font=FONT_UI, anchor="center")
         box._info_label.config(text="")
         # clear cached images if clearing both
         if box is self.before_frame:
@@ -1939,6 +2574,9 @@ class DDSConverterApp:
     # LOG
     # ─────────────────────────────────────────
     def _log(self, kind, msg):
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda: self._log(kind, msg))
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         self.log.config(state="normal")
         self.log.insert(tk.END, f"[{ts}] ", "time")
@@ -1955,7 +2593,17 @@ class DDSConverterApp:
     # ─────────────────────────────────────────
     # PROGRESS
     # ─────────────────────────────────────────
+    def _ui(self, fn):
+        """Run fn on the main thread; marshal via root.after when called off it."""
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, fn)
+        else:
+            fn()
+
     def _set_progress(self, i, total, label=""):
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda: self._set_progress(i, total, label))
+            return
         self.progress["maximum"] = total
         self.progress["value"]   = i
         pct = int(i / total * 100) if total else 0
@@ -1978,9 +2626,10 @@ class DDSConverterApp:
         finally:
             self._converting = False
             # if watch added pending files while converting, start them now
-            if self._pending_watch_files:
+            with self._watch_lock:
                 pending = self._pending_watch_files.copy()
                 self._pending_watch_files.clear()
+            if pending:
                 threading.Thread(target=lambda: self._convert_wrapper(files=pending), daemon=True).start()
             else:
                 self.root.after(0, lambda: self.start_btn.config(
@@ -1999,7 +2648,8 @@ class DDSConverterApp:
             return
         if self._converting:
             # queue them
-            self._pending_watch_files.extend(files)
+            with self._watch_lock:
+                self._pending_watch_files.extend(files)
             self._log("info", f"Watch: queued {len(files)} new file(s)")
             return
         self._converting = True
@@ -2011,7 +2661,12 @@ class DDSConverterApp:
         inp      = self.input_folder.get()
         out      = self.output_folder.get()
         fmt_default = self.format.get()
-        mips     = self.mip_maps.get()
+        mips      = self.mip_maps.get()
+        try:
+            mip_count = int(self.mip_count.get())
+        except Exception:
+            mip_count = 0
+            self._log("warn", "Invalid mip count; using 0 (full chain)")
         out_type = self.output_type.get()
         is_dds   = out_type == "DDS"
         out_ext  = self._get_out_ext()
@@ -2023,7 +2678,7 @@ class DDSConverterApp:
         if not out: errs.append("Output folder not set")
         if errs:
             for e in errs: self._log("fail", f"ERROR: {e}")
-            messagebox.showerror("Error", "\n".join(errs)); return
+            self._ui(lambda: messagebox.showerror("Error", "\n".join(errs))); return
 
         inp = os.path.abspath(inp)
         out = os.path.abspath(out)
@@ -2036,7 +2691,7 @@ class DDSConverterApp:
             self._log("warn", "No valid image files found"); return
 
         done_n = fail_n = 0
-        self.stat_done.config(text="0"); self.stat_fail.config(text="0")
+        self._ui(lambda: (self.stat_done.config(text="0"), self.stat_fail.config(text="0")))
         self._set_progress(0, total, "Starting…")
 
         self._log("head", "═" * 36)
@@ -2075,7 +2730,11 @@ class DDSConverterApp:
             extn = os.path.splitext(fname)[1]
             convert_src = src
             tmp_path = None
-            result_rec = {"fname": fname, "index": idx, "success": False, "skipped": False, "dst": None, "format": "", "reason": ""}
+            result_rec = {"fname": fname, "index": idx, "success": False, "skipped": False, "dst": None, "format": "", "reason": "", "src_size": 0}
+            try:
+                result_rec["src_size"] = os.path.getsize(src)
+            except Exception:
+                pass
 
             # Tint bake
             tint = self._file_tints.get(fname)
@@ -2088,8 +2747,115 @@ class DDSConverterApp:
                     baked.save(tmp_path)
                     convert_src = tmp_path
                 except Exception as e:
-                    # fallback to original
+                    # fallback to original — but surface it, don't fail silently
                     convert_src = src
+                    result_rec.setdefault("warnings", []).append(f"tint failed, using untinted source: {e}")
+
+            # ─── batch resize ───
+            _rm = self._resize_mode.get()
+            if _rm != "Off":
+                try:
+                    _ri = Image.open(convert_src)
+                    _rw, _rh = _ri.size
+                    _filter_map = {
+                        "Lanczos": Image.LANCZOS,
+                        "Box":     Image.BOX,
+                        "Bicubic": Image.BICUBIC,
+                    }
+                    _rf = _filter_map.get(self._resize_filter.get(), Image.LANCZOS)
+                    if _rm == "Scale %":
+                        _scale = max(1, int(self._resize_value.get())) / 100.0
+                        _nrw = max(1, int(_rw * _scale))
+                        _nrh = max(1, int(_rh * _scale))
+                    else:  # Max side (px)
+                        _maxpx  = max(1, int(self._resize_value.get()))
+                        _factor = min(1.0, _maxpx / max(_rw, _rh))
+                        _nrw = max(1, int(_rw * _factor))
+                        _nrh = max(1, int(_rh * _factor))
+                    if (_nrw, _nrh) != (_rw, _rh):
+                        _ri = _ri.resize((_nrw, _nrh), _rf)
+                        _rt = tempfile.NamedTemporaryFile(
+                            suffix=os.path.splitext(convert_src)[1] or ".png", delete=False)
+                        _rt_path = _rt.name; _rt.close()
+                        _ri.save(_rt_path)
+                        if tmp_path and os.path.exists(tmp_path):
+                            try: os.unlink(tmp_path)
+                            except: pass
+                        convert_src = _rt_path
+                        tmp_path    = _rt_path
+                        result_rec.setdefault("warnings", []).append(
+                            f"resized {_rw}\u00d7{_rh} \u2192 {_nrw}\u00d7{_nrh} ({_rm})")
+                except Exception as _re:
+                    result_rec.setdefault("warnings", []).append(f"resize error: {_re}")
+
+            # ─── power-of-two enforcement ───
+            _pow2_val = self._pow2_mode.get()
+            if _pow2_val != "Off":
+                try:
+                    _pi = Image.open(convert_src)
+                    _pw, _ph = _pi.size
+                    _pi.close()
+                    if not (_is_pot(_pw) and _is_pot(_ph)):
+                        if _pow2_val == "Warn only":
+                            result_rec.setdefault("warnings", []).append(
+                                f"non-POT {_pw}\u00d7{_ph} \u2014 engine may reject")
+                        else:
+                            if "nearest" in _pow2_val:
+                                _nw, _nh = _pot_nearest(_pw), _pot_nearest(_ph)
+                            else:
+                                _nw, _nh = _pot_next(_pw), _pot_next(_ph)
+                            _pot_img = Image.open(convert_src)
+                            _pot_img = _pot_img.resize((_nw, _nh), Image.LANCZOS)
+                            _pot_tmp = tempfile.NamedTemporaryFile(
+                                suffix=os.path.splitext(convert_src)[1] or ".png",
+                                delete=False)
+                            _pot_tmp_path = _pot_tmp.name; _pot_tmp.close()
+                            _pot_img.save(_pot_tmp_path)
+                            # discard previous tmp (tint bake) now that POT replaces it
+                            if tmp_path and os.path.exists(tmp_path):
+                                try: os.unlink(tmp_path)
+                                except: pass
+                            convert_src = _pot_tmp_path
+                            tmp_path    = _pot_tmp_path
+                            result_rec.setdefault("warnings", []).append(
+                                f"auto-resized {_pw}\u00d7{_ph} \u2192 {_nw}\u00d7{_nh} (POT)")
+                except Exception as _pe:
+                    result_rec.setdefault("warnings", []).append(f"POT check error: {_pe}")
+
+            # ─── alpha channel operation ───
+            _ao = self._file_alpha_ops.get(fname, self._alpha_op.get())
+            if _ao and _ao not in ("Off", "(global)"):
+                try:
+                    _ai  = Image.open(convert_src)
+                    _mod = True
+                    if _ao.startswith("Strip"):
+                        _ai = _ai.convert("RGB")
+                    elif "white" in _ao.lower() or "White" in _ao:
+                        _ai = _ai.convert("RGBA"); _ai.putalpha(255)
+                    elif "black" in _ao.lower() or "Black" in _ao:
+                        _ai = _ai.convert("RGBA"); _ai.putalpha(0)
+                    elif "Extract" in _ao:
+                        if "A" in _ai.getbands():
+                            _alpha_ch  = _ai.getchannel("A")
+                            _alpha_dst = os.path.join(out,
+                                os.path.splitext(fname)[0] + "_alpha.png")
+                            os.makedirs(out, exist_ok=True)
+                            _alpha_ch.save(_alpha_dst)
+                            result_rec.setdefault("warnings", []).append(
+                                f"alpha extracted \u2192 {os.path.basename(_alpha_dst)}")
+                        _mod = False  # source unchanged for main conversion
+                    if _mod:
+                        _at = tempfile.NamedTemporaryFile(
+                            suffix=os.path.splitext(convert_src)[1] or ".png", delete=False)
+                        _at_path = _at.name; _at.close()
+                        _ai.save(_at_path)
+                        if tmp_path and os.path.exists(tmp_path):
+                            try: os.unlink(tmp_path)
+                            except: pass
+                        convert_src = _at_path
+                        tmp_path    = _at_path
+                except Exception as _ae:
+                    result_rec.setdefault("warnings", []).append(f"alpha op error: {_ae}")
 
             _pfx = self._rename_prefix.get().strip()
             _sfx = self._rename_suffix.get().strip()
@@ -2125,6 +2891,10 @@ class DDSConverterApp:
                             a = probe.getchannel("A")
                             lo, hi = a.getextrema()
                             has_alpha = lo < 255
+                        elif probe.mode == "P" and "transparency" in probe.info:
+                            a = probe.convert("RGBA").getchannel("A")
+                            lo, hi = a.getextrema()
+                            has_alpha = lo < 255
                         else:
                             has_alpha = False
                     except Exception:
@@ -2148,9 +2918,17 @@ class DDSConverterApp:
                     _per_fmt = self._file_formats.get(fname)
                     if _per_fmt and _per_fmt != "(global)":
                         file_fmt = _per_fmt
+                    elif has_alpha and self._preserve_alpha.get():
+                        # auto-upgrade non-alpha formats so the channel isn't silently dropped
+                        _ALPHA_FMTS = {"DXT3", "DXT5", "BC7_UNORM", "R8G8B8A8_UNORM"}
+                        if file_fmt not in _ALPHA_FMTS:
+                            file_fmt = "DXT5" if file_fmt == "DXT1" else "BC7_UNORM"
 
                     cmd = [texconv_bin, "-f", file_fmt, "-o", out, "-y"]
-                    if not mips: cmd += ["-m", "1"]
+                    if not mips:
+                        cmd += ["-m", "1"]
+                    elif mip_count > 0:
+                        cmd += ["-m", str(mip_count)]
                     cmd.append(convert_src)
                     proc = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -2175,9 +2953,14 @@ class DDSConverterApp:
                         pass
 
                     success = proc.returncode == 0
+                    reason = ""
+                    if success and tmp_path and not (dst_file and os.path.exists(dst_file)):
+                        # texconv succeeded but the tmp->dst move above failed silently
+                        success = False
+                        reason = "converted output could not be moved to destination"
                     result_rec.update({"success": success, "dst": dst_file, "format": file_fmt})
                     if not success:
-                        result_rec["reason"] = proc.stderr.strip() or f"exit {proc.returncode}"
+                        result_rec["reason"] = reason or proc.stderr.strip() or f"exit {proc.returncode}"
                 elif out_type == "SVG":
                     try:
                         img = Image.open(convert_src)
@@ -2195,6 +2978,8 @@ class DDSConverterApp:
                         if pil_fmt == "JPEG":
                             save_kwargs["quality"] = self.jpeg_quality.get()
                             save_kwargs["optimize"] = True
+                        elif pil_fmt == "WebP":
+                            save_kwargs["quality"] = self.webp_quality.get()
                         img.save(dst_file, format=pil_fmt, **save_kwargs)
                         result_rec.update({"success": True, "dst": dst_file, "format": out_type})
                     except Exception as e:
@@ -2218,6 +3003,8 @@ class DDSConverterApp:
             _rate    = _elapsed / i if i > 0 else 0
             _eta     = f"  ETA ~{int(_rate * (total - i))}s" if i < total and _rate > 0 else ""
             _prog_label = f"[{i}/{total}]  {fname_r}{_eta}"
+            for _w in res.get("warnings", []):
+                self._log("warn", f"  \u26a0 {fname_r}: {_w}")
 
             if res.get("skipped"):
                 self._log_file_status("SKIP", os.path.basename(dst_file),
@@ -2229,27 +3016,34 @@ class DDSConverterApp:
                 except Exception:
                     pass
                 done_n += 1
-                self.stat_done.config(text=str(done_n))
+                self._ui(lambda dn=done_n: self.stat_done.config(text=str(dn)))
                 self.root.after(0, lambda f=fname_r: self._try_refresh_after(f))
-                self.root.after(0, lambda _i=i-1: self._mark_row(_i, True))
+                self.root.after(0, lambda _f=fname_r: self._mark_row(_f, True))
                 self._set_progress(i, total, _prog_label)
                 return
 
             if res.get("success"):
-                sz = f"  ({os.path.getsize(dst_file)/1024:.1f} KB)" if os.path.exists(dst_file) else ""
+                src_kb = res.get("src_size", 0) / 1024
+                dst_kb = os.path.getsize(dst_file) / 1024 if os.path.exists(dst_file) else 0
+                if src_kb > 0 and dst_kb > 0:
+                    sz = f"  ({src_kb:.1f} \u2192 {dst_kb:.1f} KB)"
+                elif dst_kb > 0:
+                    sz = f"  ({dst_kb:.1f} KB)"
+                else:
+                    sz = ""
                 self._log("done", f"  ✔ {os.path.splitext(fname_r)[0]}{out_ext}{sz}")
                 note = ""
                 if is_dds and self.dds_mode.get().startswith("Auto"):
                     note = "alpha detected" if file_fmt.startswith("DXT5") else "no alpha"
                 self._log_file_status("OK", os.path.basename(dst_file), reason=note, fmt=file_fmt)
                 done_n += 1
-                self.stat_done.config(text=str(done_n))
+                self._ui(lambda dn=done_n: self.stat_done.config(text=str(dn)))
                 self.root.after(0, lambda f=fname_r: self._try_refresh_after(f))
             else:
                 self._log("fail", f"  ✘ FAILED: {fname_r}  ({res.get('reason', '')})")
                 self._log_file_status("FAIL", fname_r, reason=res.get("reason", ""), fmt=file_fmt)
                 fail_n += 1
-                self.stat_fail.config(text=str(fail_n))
+                self._ui(lambda fn_=fail_n: self.stat_fail.config(text=str(fn_)))
 
             try:
                 out_name = os.path.basename(dst_file) if dst_file else os.path.basename(fname_r)
@@ -2261,7 +3055,7 @@ class DDSConverterApp:
             except Exception:
                 pass
 
-            self.root.after(0, lambda _i=i-1, _ok=res.get("success"): self._mark_row(_i, _ok))
+            self.root.after(0, lambda _f=fname_r, _ok=res.get("success"): self._mark_row(_f, _ok))
             self._set_progress(i, total, _prog_label)
 
         # ── Dispatch: sequential or parallel with chunking ──
@@ -2304,15 +3098,13 @@ class DDSConverterApp:
                   f" ✔ {done_n}  ✘ {fail_n}  in {elapsed}s")
         self._log("head", "═" * 36)
         self._set_progress(total, total, "Done")
-        self.progress_lbl.config(text=f"✔ {done_n}/{total} converted in {elapsed}s")
+        self._ui(lambda: self.progress_lbl.config(text=f"✔ {done_n}/{total} converted in {elapsed}s"))
 
-    def _mark_row(self, idx, success):
+    def _mark_row(self, fname, success):
         try:
-            if idx < len(self._file_names):
-                fname = self._file_names[idx]
-                if fname != self._selected_file and fname in self._row_labels:
-                    self._row_labels[fname].config(
-                        fg=COLORS["done"] if success else COLORS["fail"])
+            if fname != self._selected_file and fname in self._row_labels:
+                self._row_labels[fname].config(
+                    fg=COLORS["done"] if success else COLORS["fail"])
         except Exception:
             pass
 
@@ -2347,6 +3139,7 @@ class DDSConverterApp:
         if self._selected_file and self._selected_file in self._row_frames:
             self._row_frames[self._selected_file].config(bg=COLORS["accent2"])
             self._row_labels[self._selected_file].config(bg=COLORS["accent2"], fg="#fff")
+        self._apply_file_filter()
 
     def _remove_selected(self):
         f = self._selected_file
@@ -2395,7 +3188,8 @@ class DDSConverterApp:
                 if not self._converting:
                     self.start_thread_for_files(new)
                 else:
-                    self._pending_watch_files.extend(new)
+                    with self._watch_lock:
+                        self._pending_watch_files.extend(new)
                     self._log("info", f"Watch: queued {len(new)} file(s) for later")
             self._watched_files = current
         self.root.after(1500, self._watch_poll)
@@ -2420,6 +3214,10 @@ def _run_cli(args):
                         choices=["DDS","PNG","JPG","TGA","BMP","WebP","SVG"],
                         help="Output file type (default: DDS)")
     parser.add_argument("--no-mips", action="store_true", help="Disable mipmap generation")
+    parser.add_argument("--mip-count", type=int, default=0,
+                        help="Number of mip levels to generate (0 = full chain, default: 0)")
+    parser.add_argument("--no-preserve-alpha", action="store_true",
+                        help="Disable automatic alpha-format upgrade (alpha may be lost)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel worker count (default: 1)")
     parser.add_argument("--overwrite", choices=["Never","Always","Versioned"], default="Never")
@@ -2427,6 +3225,13 @@ def _run_cli(args):
                         help="Use texconv_gpu.exe if present")
     parser.add_argument("--quality", type=int, default=90,
                         help="JPEG quality 1-100 (default: 90)")
+    parser.add_argument("--tint-color", default="",
+                        help="Hex tint colour applied to all files (e.g. #FF0000)")
+    parser.add_argument("--tint-intensity", type=float, default=0.4,
+                        help="Tint blend intensity 0.0\u20131.0 (default: 0.4)")
+    parser.add_argument("--tint-mode", default="Multiply",
+                        choices=["Multiply", "Screen", "Overlay", "Add", "Tint (Lerp)"],
+                        help="Tint blend mode (default: Multiply)")
     ns = parser.parse_args(args)
 
     inp = os.path.abspath(ns.input)
@@ -2442,10 +3247,15 @@ def _run_cli(args):
     out_type = ns.out_type
     is_dds   = out_type == "DDS"
     fmt      = ns.format
-    mips     = not ns.no_mips
-    workers  = max(1, ns.workers)
-    overwrite = ns.overwrite
-    quality  = ns.quality
+    mips          = not ns.no_mips
+    mip_count_cli = max(0, ns.mip_count)
+    preserve_alpha_cli = not ns.no_preserve_alpha
+    workers       = max(1, ns.workers)
+    overwrite      = ns.overwrite
+    quality        = ns.quality
+    tint_color     = ns.tint_color.strip()
+    tint_intensity = max(0.0, min(1.0, ns.tint_intensity))
+    tint_mode      = ns.tint_mode
 
     # resolve texconv binary
     texconv_bin = os.path.join(APP_DIR, TEXCONV_PATH)
@@ -2472,10 +3282,27 @@ def _run_cli(args):
         stem = os.path.splitext(fname)[0]
         extn = os.path.splitext(fname)[1]
         dst  = os.path.join(out, stem + out_ext)
+        _tmp_tint = None
+
+        if tint_color:
+            try:
+                _baked = apply_tint(Image.open(src), tint_color, tint_intensity, tint_mode)
+                _tmp = tempfile.NamedTemporaryFile(suffix=extn, delete=False)
+                _tmp_tint = _tmp.name; _tmp.close()
+                _baked.save(_tmp_tint)
+                src = _tmp_tint
+            except Exception as _e:
+                print(f"  WARNING: tint failed for {fname}: {_e}", file=sys.stderr)
+
+        def _cleanup():
+            if _tmp_tint:
+                try: os.unlink(_tmp_tint)
+                except: pass
 
         with write_lock:
             if os.path.exists(dst):
                 if overwrite == "Never":
+                    _cleanup()
                     return (fname, "SKIP", "", "already exists")
                 elif overwrite == "Versioned":
                     base, e2 = os.path.splitext(dst)
@@ -2486,22 +3313,42 @@ def _run_cli(args):
         try:
             if is_dds:
                 file_fmt = fmt
+                # always detect alpha so preserve_alpha_cli works for all modes
+                try:
+                    _probe = Image.open(src)
+                    _bands = _probe.getbands()
+                    if "A" in _bands:
+                        has_a = _probe.getchannel("A").getextrema()[0] < 255
+                    elif _probe.mode == "P" and "transparency" in _probe.info:
+                        has_a = _probe.convert("RGBA").getchannel("A").getextrema()[0] < 255
+                    else:
+                        has_a = False
+                    _probe.close()
+                except Exception:
+                    has_a = True
                 if fmt == "Auto":
-                    try:
-                        p = Image.open(src)
-                        has_a = "A" in p.getbands() and p.getchannel("A").getextrema()[0] < 255
-                    except Exception:
-                        has_a = True
                     file_fmt = "DXT5" if has_a else "DXT1"
                 cmd = [texconv_bin, "-f", file_fmt, "-o", out, "-y"]
-                if not mips: cmd += ["-m", "1"]
+                if not mips:
+                    cmd += ["-m", "1"]
+                elif mip_count_cli > 0:
+                    cmd += ["-m", str(mip_count_cli)]
+                # auto-upgrade non-alpha formats when source has alpha
+                if preserve_alpha_cli and has_a:
+                    _ALPHA_FMTS = {"DXT3", "DXT5", "BC7_UNORM", "R8G8B8A8_UNORM"}
+                    if file_fmt not in _ALPHA_FMTS:
+                        file_fmt = "DXT5" if file_fmt == "DXT1" else "BC7_UNORM"
+                        cmd[2] = file_fmt
                 cmd.append(src)
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode != 0:
+                    _cleanup()
                     return (fname, "FAIL", file_fmt, proc.stderr.strip() or f"exit {proc.returncode}")
+                _cleanup()
                 return (fname, "OK", file_fmt, "")
             elif out_type == "SVG":
                 save_as_svg(Image.open(src), dst)
+                _cleanup()
                 return (fname, "OK", "SVG", "")
             else:
                 img = Image.open(src)
@@ -2510,8 +3357,10 @@ def _run_cli(args):
                     img = img.convert("RGB")
                 kw = {"quality": quality, "optimize": True} if pil_fmt == "JPEG" else {}
                 img.save(dst, format=pil_fmt, **kw)
+                _cleanup()
                 return (fname, "OK", out_type, "")
         except Exception as e:
+            _cleanup()
             return (fname, "FAIL", out_type, str(e))
 
     total = len(files)
