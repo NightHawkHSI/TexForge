@@ -5,16 +5,24 @@
 [![Downloads](https://img.shields.io/github/downloads/NightHawkHSI/TexForge/total?label=downloads&color=00e87a)](https://github.com/NightHawkHSI/TexForge/releases)
 ![Views](https://komarev.com/ghpvc/?username=NightHawkHSI&repo=TexForge&label=views&color=0096ff)
 
-Multi-format texture pipeline manager for modders and technical artists. Handles DDS, PNG, JPG, TGA, BMP, WebP, and SVG output with per-file tinting, PBR naming rules, batch conversion, and CI-ready headless mode.
+![TexForge conversion preview](screenshots/conversion-preview.png)
+![TexForge info window](screenshots/info-window.png)
+
+TexForge is a desktop texture conversion tool built in Python/Tkinter, designed primarily for game modders and 3D artists. It provides a graphical pipeline for batch-converting image files (PNG, JPG, TGA, BMP) into various output formats — most notably DDS (DirectX Surface), the standard texture format used by game engines like GTA V, Skyrim, Unity, and Unreal Engine.
+
+It wraps Microsoft's `texconv.exe` for DDS encoding and uses Pillow for all other format handling and image processing.
 
 ## Key capabilities
 
-- Project system: save and load job configurations (folders, presets, per-file tints).
-- Folder templates: quick project scaffolds for `Gear`, `UI`, `Vehicles`, `Weapons`.
-- Export manifests: per-run JSON summary of converted files (format, size, status).
-- Multi-threaded conversion with chunking and configurable worker count.
-- Optional GPU-enabled conversion (place `texconv_gpu.exe` beside the app).
-- Per-file tint/specular baking, live Before/After preview, and structured conversion logs (`texforge_conversion.log`).
+- **Multi-format output** — DDS (DXT1/3/5, BC4/5/7), PNG, JPG, TGA, BMP, WebP, and SVG.
+- **Engine presets** — one-click profiles for FiveM/GTA V, Skyrim, Unity, Unreal, UI sprites, and PBR material workflows.
+- **Tint/colorization engine** — apply per-file or batch color tints using blend modes like Multiply, Screen, Overlay, Add, and Lerp.
+- **Live before/after preview** — with zoom, checkerboard alpha display, and mipmap level scrubbing.
+- **Parallel batch conversion** — multi-worker support for fast processing of large texture libraries.
+- **Watch folder mode** — auto-converts new files as they appear in the input folder.
+- **Project save/load** — preserves all settings, tints, and per-file overrides as JSON.
+- **Headless CLI mode** — scriptable batch conversion without launching the GUI.
+- **Structured logging** — per-file JSONL conversion log and an export manifest written to the output folder.
 
 ## Why use this tool
 

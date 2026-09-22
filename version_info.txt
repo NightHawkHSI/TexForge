@@ -1,0 +1,25 @@
+TexForge v8.0
+
+Bug fixes:
+- Fixed a crash risk where conversion progress/log updates could corrupt the UI or throw errors during batch conversion (background thread was touching Tk widgets directly).
+- Fixed the file queue marking the wrong row as done/failed during single-file conversion and Watch Folder auto-convert.
+- Fixed alpha (transparency) being silently dropped on palette-mode PNGs (common for UI icons/sprites) even with "Preserve alpha" enabled.
+- Fixed a race condition in Watch Folder mode that could silently drop newly detected files from the conversion queue.
+- Fixed the app crashing on an invalid mipmap count instead of falling back to a safe default.
+- Fixed tint baking failures being silently swallowed — now logged as a warning instead of quietly converting the untinted image.
+- Fixed a case where a failed file move after conversion could still be reported as a successful conversion.
+- Fixed the CLI (--cli) and GUI picking different DDS formats for the same image due to inconsistent alpha detection.
+- Fixed settings loading so one corrupted/invalid field no longer resets every setting after it back to default.
+- Fixed the app crashing on startup if the saved theme colors were corrupted.
+- Fixed the app crashing when switching themes mid-session.
+- Fixed long conversion log lines overflowing past the log panel instead of wrapping.
+
+UI/window fixes:
+- Fixed the window not fitting the screen / bottom controls being hidden behind the taskbar on smaller displays.
+- Fixed maximizing snapping back to the main monitor instead of filling whichever monitor the window is on.
+- Fixed the TOTAL/DONE/FAIL/TINTED stats bar being pushed off-screen and invisible on smaller (e.g. 15") screens.
+- Added the ability to resize the window by dragging its edges/corners (previously only draggable by the title bar).
+
+Docs:
+- Corrected README references to the actual log/settings/manifest filenames used by the app.
+- Added download count and view count badges.
