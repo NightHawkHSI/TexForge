@@ -1,6 +1,9 @@
-# Texture Pipeline Manager — v7.0
-# TexForge — v7.0
+# Texture Pipeline Manager â€” v8.0
+# TexForge â€” v8.0
 > by DiccChops
+
+[![Downloads](https://img.shields.io/github/downloads/DiccChops/TexForge/total?label=downloads&color=00e87a)](https://github.com/DiccChops/TexForge/releases)
+![Views](https://komarev.com/ghpvc/?username=DiccChops&repo=TexForge&label=views&color=0096ff)
 
 Multi-format texture pipeline manager for modders and technical artists. Handles DDS, PNG, JPG, TGA, BMP, WebP, and SVG output with per-file tinting, PBR naming rules, batch conversion, and CI-ready headless mode.
 
@@ -11,7 +14,7 @@ Multi-format texture pipeline manager for modders and technical artists. Handles
 - Export manifests: per-run JSON summary of converted files (format, size, status).
 - Multi-threaded conversion with chunking and configurable worker count.
 - Optional GPU-enabled conversion (place `texconv_gpu.exe` beside the app).
-- Per-file tint/specular baking, live Before/After preview, and structured conversion logs (`dds_conversion.log`).
+- Per-file tint/specular baking, live Before/After preview, and structured conversion logs (`texforge_conversion.log`).
 
 ## Why use this tool
 
@@ -22,7 +25,7 @@ Multi-format texture pipeline manager for modders and technical artists. Handles
 ## Requirements
 
 - Windows 10 / 11 (Win32 features used)
-- `texconv.exe` (DirectXTex) — required for DDS output. For GPU acceleration, provide a compatible `texconv_gpu.exe` binary and enable GPU mode in the UI.
+- `texconv.exe` (DirectXTex) â€” required for DDS output. For GPU acceleration, provide a compatible `texconv_gpu.exe` binary and enable GPU mode in the UI.
 - Python 3.x + Pillow to run from source (or use the standalone executable built from this repo)
 
 ## Quick start
@@ -39,7 +42,7 @@ Multi-format texture pipeline manager for modders and technical artists. Handles
 
 ## Export manifest
 
-- Each conversion run writes `export_manifest_YYYYMMDD_HHMMSS.json` into the output folder. Manifest entries include `file`, `status` (OK/SKIP/FAIL), `format`, `reason`, and `size` — suitable for automated importers or asset catalogs.
+- Each conversion run writes `export_manifest.json` into the output folder (overwritten each run). Manifest entries include `file`, `status` (OK/SKIP/FAIL), `format`, `reason`, and `size` â€” suitable for automated importers or asset catalogs.
 
 ## Performance and scaling
 
@@ -48,7 +51,7 @@ Multi-format texture pipeline manager for modders and technical artists. Handles
 
 ## Supported Input / Output formats
 
-Supported input: `.png`, `.jpg`, `.jpeg`, `.tga`, `.bmp`
+Supported input: `.png`, `.jpg`, `.jpeg`, `.tga`, `.bmp`, `.dds`, `.webp`
 
 Output formats: `DDS`, `PNG`, `JPG`, `TGA`, `BMP`, `WebP`, `SVG`.
 
@@ -56,11 +59,12 @@ When outputting `DDS`, formats supported include: `DXT1`, `DXT3`, `DXT5`, `BC4_U
 
 ## Files of interest
 
-- `DDS.py` — main application source (inspect or run directly with Python)
-- `projects/` — sample templates and saved project JSON files
-- `dds_conversion.log` — machine-friendly JSONL per-file log (appends during conversion)
-- `export_manifest_*.json` — per-run manifest written into the output folder
-- `dds_crash.log` — crash diagnostics
+- `DDS.py` â€” main application source (inspect or run directly with Python)
+- `projects/` â€” sample templates and saved project JSON files
+- `texforge_conversion.log` â€” machine-friendly JSONL per-file log (appends during conversion)
+- `export_manifest.json` â€” per-run manifest written into the output folder
+- `texforge_crash.log` â€” crash diagnostics
+- `texforge_settings.json` â€” persisted UI/theme/output settings
 
 ## Security & redistribution
 
@@ -69,4 +73,3 @@ When outputting `DDS`, formats supported include: `DXT1`, `DXT3`, `DXT5`, `BC4_U
 ## Support and contribution
 
 Open issues and pull requests are welcome. Describe the target pipeline if you want custom template presets, CI-friendly manifest formats, or other integrations.
-
